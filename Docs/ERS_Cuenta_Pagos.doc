@@ -1,0 +1,192 @@
+<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+<head>
+<meta charset='utf-8'>
+<title>ERS - Cuenta y Pagos</title>
+<style>
+    body { font-family: 'Arial', sans-serif; line-height: 1.6; color: #333; }
+    h1 { color: #2C3E50; font-size: 26px; border-bottom: 2px solid #2C3E50; padding-bottom: 10px; margin-top: 20px; }
+    h2 { color: #2980B9; font-size: 20px; margin-top: 20px; border-bottom: 1px solid #BDC3C7; padding-bottom: 5px; }
+    h3 { color: #16A085; font-size: 16px; margin-top: 15px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 15px; margin-bottom: 20px; }
+    th, td { border: 1px solid #BDC3C7; padding: 10px; text-align: left; }
+    th { background-color: #ECF0F1; color: #2C3E50; font-weight: bold; }
+    .req-box { background-color: #F8F9F9; padding: 15px; border-left: 5px solid #3498DB; margin-bottom: 20px; }
+    .req-title { font-weight: bold; color: #2C3E50; font-size: 15px; margin-bottom: 10px; }
+    ul { margin-top: 5px; margin-bottom: 10px; }
+    .note { font-style: italic; color: #7F8C8D; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Especificación de Requisitos de Software (ERS)</h1>
+<p><strong>Microservicio:</strong> Cuenta y Pagos<br>
+<strong>Arquitectura Destino:</strong> C# .NET 8, Entity Framework Core, MassTransit, SQL Server/PostgreSQL<br>
+<strong>Versión:</strong> 2.0 (Extendida)</p>
+
+<h2>1. Introducción</h2>
+<h3>1.1 Propósito</h3>
+<p>Este documento define exhaustivamente los requisitos funcionales y no funcionales para el microservicio de "Cuenta y Pagos". Su propósito es proveer una especificación técnica profunda que guíe el desarrollo del backend, estableciendo las reglas de validación, los contratos de comunicación asíncrona y los límites estrictos del modelo de persistencia.</p>
+
+<h3>1.2 Alcance</h3>
+<p>El sistema se encargará de abstraer y procesar toda operación financiera transaccional dentro del ecosistema del restaurante. Abarca el ciclo operativo de las cajas, consolidación de cobros mediante pagos mixtos, conservación de históricos inmutables, gestión de extornos y comunicación con el proveedor SAT para CFDI 4.0. Se excluyen funcionalidades de toma de órdenes, cálculo de impuestos dinámicos por producto y distribución de propinas a nivel de recursos humanos.</p>
+
+<h3>1.3 Glosario</h3>
+<ul>
+    <li><strong>Snapshot:</strong> Fotografía estática de los datos (ej. precio de un platillo) en un momento específico, diseñada para no cambiar nunca.</li>
+    <li><strong>PAC:</strong> Proveedor Autorizado de Certificación (SAT).</li>
+    <li><strong>DLQ (Dead Letter Queue):</strong> Cola de mensajes donde se envían los eventos que fallaron repetidamente en su procesamiento.</li>
+</ul>
+
+<h2>2. Descripción General</h2>
+<h3>2.1 Perspectiva del Producto</h3>
+<p>El microservicio es un componente independiente dentro de una arquitectura de microservicios orientada a eventos. Su única vía de entrada síncrona es a través del API Gateway (peticiones HTTP/REST de clientes web/móviles), mientras que la comunicación interna (ej. saber cuándo una mesa está lista para pagar) se realiza de manera asíncrona mediante un Message Broker (RabbitMQ/Azure Service Bus vía MassTransit).</p>
+
+<h3>2.2 Restricciones Técnicas del Diseño</h3>
+<ul>
+    <li><strong>Capa de Datos Estricta:</strong> El microservicio operará exclusivamente con las 7 entidades definidas en la sección 4. No se permite la creación de tablas adicionales para lógica de negocio.</li>
+    <li><strong>Aislamiento de Estado:</strong> No se permiten consultas directas a las bases de datos de otros microservicios (ej. Catálogo de Productos u Órdenes). Todos los datos necesarios deben viajar en el payload de los eventos o peticiones.</li>
+</ul>
+
+<h2>3. Requisitos Funcionales Detallados</h2>
+
+<div class="req-box">
+    <div class="req-title">RF-01: Sincronización Asíncrona de Pre-Cuentas</div>
+    <p><strong>Descripción:</strong> El sistema debe suscribirse al bus de eventos para recibir las comandas listas para cobro, guardando una copia local que permita operar la caja de forma autónoma.</p>
+    <ul>
+        <li><strong>Precondición:</strong> El Message Broker está operativo y emite el evento <code>DinningSessionReady</code>.</li>
+        <li><strong>Reglas de Negocio:</strong> El payload debe contener la sumatoria financiera validada. Si el evento se recibe duplicado (mismo Event ID), debe descartarse silenciosamente garantizando idempotencia. Si llega una actualización para una misma sesión, se debe sobrescribir el snapshot anterior.</li>
+        <li><strong>Postcondición:</strong> La cuenta está disponible en caché/memoria temporal para ser consultada inmediatamente por el cajero sin latencia de red.</li>
+    </ul>
+</div>
+
+<div class="req-box">
+    <div class="req-title">RF-02: Procesamiento Transaccional de Cobros Mixtos</div>
+    <p><strong>Descripción:</strong> El sistema debe procesar los pagos de los clientes, soportando fraccionar el total en múltiples métodos (ej. $100 efectivo, $200 tarjeta) en una sola operación.</p>
+    <ul>
+        <li><strong>Precondición:</strong> Existe una sesión de consumo validada. El cajero tiene un turno de caja <code>ABIERTO</code>.</li>
+        <li><strong>Reglas de Negocio:</strong> 
+            <ol>
+                <li>La suma de todos los montos en el arreglo de pagos debe ser mayor o igual al total de la orden.</li>
+                <li>No se permite guardar datos parciales. Si falla la red al registrar un pago con tarjeta en la base de datos, toda la operación debe hacer Rollback.</li>
+                <li>Si el cobro excede el total y contiene efectivo, el excedente se considera "cambio" (no se persiste como ingreso del restaurante).</li>
+            </ol>
+        </li>
+        <li><strong>Postcondición:</strong> Se consolida la <code>TransaccionPago</code>, se emite el evento <code>PagoCompletado</code> al broker, y se libera la sesión original.</li>
+    </ul>
+</div>
+
+<div class="req-box">
+    <div class="req-title">RF-03: Control de Ciclo de Vida de Caja (Apertura y Cierre)</div>
+    <p><strong>Descripción:</strong> Gestión estricta de los periodos operativos de cada cajero para auditoría financiera.</p>
+    <ul>
+        <li><strong>Precondición:</strong> El usuario está autenticado y su ID está presente en los Claims del JWT.</li>
+        <li><strong>Reglas de Negocio:</strong>
+            <ol>
+                <li><strong>Apertura:</strong> Se exige un <code>fondo_inicial</code> numérico válido. Si el usuario ya posee un turno <code>ABIERTO</code>, se rechaza la petición con HTTP 409 (Conflict).</li>
+                <li><strong>Cierre:</strong> Se exige la captura del <code>efectivo_declarado</code>. El sistema compara el efectivo físico contra el cálculo interno y marca el turno como <code>CERRADO</code> (cuadre exacto) o <code>DESCUADRADO</code> (diferencias).</li>
+            </ol>
+        </li>
+        <li><strong>Postcondición:</strong> El turno queda inhabilitado para recibir nuevas transacciones.</li>
+    </ul>
+</div>
+
+<div class="req-box">
+    <div class="req-title">RF-04: Arqueo de Caja y Cuadre en Tiempo Real</div>
+    <p><strong>Descripción:</strong> El sistema debe permitir consultar los ingresos agrupados del turno activo para realizar cortes parciales ciegos.</p>
+    <ul>
+        <li><strong>Reglas de Negocio:</strong> El motor de cálculo procesará las transacciones confirmadas asociadas al <code>TurnoCaja</code> actual, agrupándolas estrictamente por el atributo <code>metodo_pago</code> de los desgloses.</li>
+        <li><strong>Métricas de Salida:</strong> Retorna total en tarjetas, total en efectivo cobrado, y el valor consolidado (Efectivo Cobrado + Fondo Inicial).</li>
+    </ul>
+</div>
+
+<div class="req-box">
+    <div class="req-title">RF-05: Inmutabilidad e Historial de Ventas</div>
+    <p><strong>Descripción:</strong> Mecanismo de persistencia de solo lectura para tickets cobrados, protegiéndolos contra modificaciones futuras en catálogos externos.</p>
+    <ul>
+        <li><strong>Reglas de Negocio:</strong> Los registros en <code>DetalleTransaccion</code> deben copiar en texto plano el nombre y precio del platillo vigente al momento del cobro. Está prohibido utilizar <code>JOINs</code> o cargar datos desde el microservicio de catálogo al consultar este historial.</li>
+        <li><strong>Consulta:</strong> Endpoints GET con paginación que implementen filtros por rango de fechas (<code>fecha_cobro</code>) y estatus.</li>
+    </ul>
+</div>
+
+<div class="req-box">
+    <div class="req-title">RF-06: Cancelación y Extorno de Transacciones</div>
+    <p><strong>Descripción:</strong> Proceso para anular una cuenta finalizada, justificando la acción y controlando los accesos.</p>
+    <ul>
+        <li><strong>Precondición:</strong> El ticket existe y está <code>COMPLETADO</code>. El usuario que ejecuta la acción posee el rol de 'Gerente' o 'Administrador' (validado vía JWT Auth Middleware).</li>
+        <li><strong>Reglas de Negocio:</strong> La entidad original no se elimina (Soft Delete o Hard Delete prohibidos). Se cambia su estado a <code>CANCELADO</code> y se inserta un registro obligatorio en <code>CancelacionVenta</code> con la fecha y el motivo.</li>
+    </ul>
+</div>
+
+<div class="req-box">
+    <div class="req-title">RF-07: Emisión Asíncrona CFDI 4.0</div>
+    <p><strong>Descripción:</strong> Flujo fiscal de facturación electrónica sin impactar la experiencia de la interfaz de usuario en caja.</p>
+    <ul>
+        <li><strong>Reglas de Negocio:</strong> 
+            <ol>
+                <li>El endpoint recibe RFC, uso de CFDI y el ID de la transacción.</li>
+                <li>Busca o crea el cliente en el catálogo <code>ClienteFiscal</code>.</li>
+                <li>Despacha un Job en segundo plano (vía Hangfire o consumidor interno de MassTransit).</li>
+                <li>Retorna HTTP 202 (Accepted) inmediatamente.</li>
+                <li>El Worker se comunica con la API del PAC. Al recibir el XML, almacena el UUID en <code>FacturaFiscal</code>.</li>
+            </ol>
+        </li>
+    </ul>
+</div>
+
+<h2>4. Requisitos de Datos (Modelo de Persistencia Estricto)</h2>
+<p>El microservicio se limita a operar las siguientes siete tablas. Cualquier nueva tabla requiere una modificación formal de esta ERS.</p>
+
+<table>
+    <tr>
+        <th>Entidad</th>
+        <th>Descripción y Propósito</th>
+        <th>Atributos Críticos</th>
+    </tr>
+    <tr>
+        <td><strong>TurnoCaja</strong></td>
+        <td>Gestiona la sesión operativa del cajero (Aperturas y Cierres).</td>
+        <td><code>cajero_id</code>, <code>fondo_inicial</code>, <code>efectivo_declarado</code>, <code>estado</code> (ABIERTO, CERRADO, DESCUADRADO).</td>
+    </tr>
+    <tr>
+        <td><strong>TransaccionPago</strong></td>
+        <td>Cabecera inmutable que almacena los totales y estados del ticket cobrado.</td>
+        <td><code>folio</code>, <code>turno_caja_id</code>, <code>dinning_session_id</code>, <code>total</code>, <code>estado</code> (COMPLETADO, CANCELADO).</td>
+    </tr>
+    <tr>
+        <td><strong>DetalleTransaccion</strong></td>
+        <td>Snapshot duro de los platillos para preservar la historia si los menús cambian.</td>
+        <td><code>nombre_platillo</code> (varchar plano), <code>cantidad</code>, <code>precio_unitario</code>, <code>importe</code>.</td>
+    </tr>
+    <tr>
+        <td><strong>DesglosePago</strong></td>
+        <td>Permite soportar pagos combinados para un solo ticket.</td>
+        <td><code>metodo_pago</code>, <code>monto</code>, <code>referencia_autorizacion</code> (para terminales).</td>
+    </tr>
+    <tr>
+        <td><strong>CancelacionVenta</strong></td>
+        <td>Rastro de auditoría 1 a 1 para extornos gerenciales.</td>
+        <td><code>autorizador_id</code>, <code>motivo</code>, <code>fecha_cancelacion</code>.</td>
+    </tr>
+    <tr>
+        <td><strong>ClienteFiscal</strong></td>
+        <td>Catálogo de datos recurrentes para agilizar la facturación.</td>
+        <td><code>rfc</code>, <code>razon_social</code>, <code>regimen_fiscal</code>, <code>codigo_postal</code>.</td>
+    </tr>
+    <tr>
+        <td><strong>FacturaFiscal</strong></td>
+        <td>Acuse final de timbrado emitido por el SAT (CFDI 4.0).</td>
+        <td><code>folio_fiscal_sat</code>, <code>uso_cfdi</code>, <code>estado</code>, <code>fecha_timbrado</code>.</td>
+    </tr>
+</table>
+
+<h2>5. Requisitos No Funcionales (RNF)</h2>
+<ul>
+    <li><strong>RNF-01 (Transaccionalidad ACID):</strong> Las operaciones que involucren inserciones múltiples (como RF-02) deben ejecutarse utilizando la abstracción <code>IDbContextTransaction</code> en Entity Framework Core. El nivel de aislamiento mínimo debe ser <em>Read Committed</em>.</li>
+    <li><strong>RNF-02 (Tolerancia a Fallos y Resiliencia):</strong> Las conexiones HTTP hacia el PAC fiscal (RF-07) deben implementarse inyectando políticas de <code>Polly</code> en el <code>HttpClient</code>. Se exige una política de reintentos exponenciales para fallos transitorios (HTTP 503, Timeout) y protección mediante <em>Circuit Breaker</em> si el PAC cae de forma definitiva.</li>
+    <li><strong>RNF-03 (Idempotencia en Consumo):</strong> Todos los consumidores de eventos asíncronos (MassTransit) deben implementar el patrón Outbox/Inbox para garantizar que un evento procesado no altere el estado de la base de datos más de una vez.</li>
+    <li><strong>RNF-04 (Auditoría y Seguridad):</strong> Los Controladores de API deben extraer obligatoriamente la identidad del usuario desde los <em>Claims</em> del token JWT proporcionado por el API Gateway. Bajo ninguna circunstancia el cliente Front-End enviará el ID del usuario en el payload de las peticiones (previene inyección de identidades).</li>
+    <li><strong>RNF-05 (Precisión Financiera):</strong> Todos los atributos que manejen moneda (precios, importes, totales) deben mapearse en la base de datos y en C# utilizando tipos de datos precisos (ej. <code>decimal(18,2)</code> en SQL y <code>decimal</code> en C#). El uso de <code>float</code> o <code>double</code> está estrictamente prohibido.</li>
+</ul>
+
+</body>
+</html>
