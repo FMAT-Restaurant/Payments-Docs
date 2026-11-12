@@ -6,13 +6,9 @@ Documentación técnica, arquitectónica y estándares operativos del microservi
 
 ## 🗂️ Documentación y Diagramas del Proyecto
 - **Especificaciones:**
-  - [ERS Cuenta Pagos](Docs/ERS_Cuenta_Pagos.doc)
-- **Diagramas Operacionales y de Secuencia:**
-  - [Flujo de Trabajo Jira](Diagrams/Flujo_de_Trabajo_Jira.png)
-  - [Flujo de Cobro y Pagos Mixtos](Diagrams/Flujo%20de%20Cobro%20y%20Pagos%20Mixtos.png)
-  - [Flujo de Arqueo y Corte de Caja](Diagrams/Flujo%20de%20Arqueo%20y%20Corte%20de%20Caja.png)
-  - [Flujo de Facturación Electrónica (Post-Venta)](Diagrams/Flujo%20de%20Facturación%20Electrónica%20(Post-Venta).png)
-  - [Flujo de Cancelación y Extorno (Excepción)](Diagrams/Flujo%20de%20Cancelación%20y%20Extorno%20(Excepción).png)
-  - [Payment Microservice Diagram Flow Operational](Diagrams/Payment%20microservice%20diagram%20flow%20operational.png)
-  - [Payment Microservice Sequence Diagram](Diagrams/Payment%20microservice%20sequence%20diagram.png)
+
+  - **[ERS Cuenta y Pagos v3.0 (Markdown - Actualizado con Jira, revisar esta version)](Docs/ERS_Cuenta_Pagos.md)** ⭐
+  - [ERS Cuenta Pagos (Versión preliminar .doc)](Docs/ERS_Cuenta_Pagos.doc)
+- **Diagramas Operacionales y de Secuencia Actualizados (Mermaid & HUs Jira):**
+  - **[Diagramas de Flujo y Secuencia del Microservicio (Markdown)](Diagrams/DIAGRAMAS_DE_FLUJO_Y_SECUENCIA.md)** ⭐
 
